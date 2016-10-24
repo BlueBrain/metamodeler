@@ -21,8 +21,15 @@ from .utils import prettyPrintJSON
 
 # Import from nat
 from nat.modelingParameter import getParameterTypes
-from nat.annotationSearch import ParameterSearch, ConditionAtom
+from nat.annotationSearch import ParameterSearch, ConditionAtom, CompiledCorpus
 from nat.gitManager import GitManager
+
+
+class IncompleteItem(QtGui.QListWidgetItem):
+
+    def __lt__(self, other):
+        return stripIncomplete(self.text()) < stripIncomplete(other.text())
+
 
 
 def stripIncomplete(string):
@@ -65,8 +72,8 @@ class ProjectSetup:
     def __repr__(self):
         return str(self.toJSON())
 
-    def toJSON(self):        
-        return {"path": self.path, 
+    def toJSON(self):
+        return {"path": self.path,
                 "files": {fName:f.toJSON() for fName, f in self.files.items()}}
 
 
@@ -77,7 +84,7 @@ class ParamDic(dict):
         super(ParamDic, self).__setitem__(key, value)
 
 class FileSetup:
-    
+
     def __init__(self, fileName):
         self.fileName = fileName
         self.parameters = ParamDic() # Indexed by parameter name
@@ -107,7 +114,7 @@ class FileSetup:
         return str(self.toJSON())
 
     def toJSON(self):
-        return {"fileName": self.fileName, 
+        return {"fileName": self.fileName,
                 "parameters": {pName:p.toJSON() for pName, p in self.parameters.items()}}
 
 
@@ -125,12 +132,17 @@ class Window(QtGui.QMainWindow):
         #self.currentModelingParam = None
         self.projectSetup = None
         self.ignore_patterns = ["*.*~"]
+        
+        self.noUpdatePropositionSelection = False
 
         self.editPreferences()
 
         self.gitMng = GitManager(self.settings.config["GIT"])
-        
-        self.dbPath   = os.path.abspath(self.settings.config["GIT"]["local"])
+
+        self.dbPath   = os.path.abspath(self.settings.config["GIT"]["local"])        
+        self.compiledCorpus = CompiledCorpus(os.path.join(self.dbPath, "annotations.bin"))    
+        self.compiledCorpus.compileCorpus(pathDB=self.dbPath)
+        self.searcher = ParameterSearch(pathDB=self.dbPath, compiledCorpus=self.compiledCorpus)
 
 
     def editPreferences(self):
@@ -242,13 +254,13 @@ class Window(QtGui.QMainWindow):
 
     def setupProjectGB(self):
         # Widgets
-        self.openProjectBtn        = QtGui.QPushButton("Open project")
-        self.generateBtn        = QtGui.QPushButton("Generate model")
-        self.projectFiles        = QtGui.QListWidget()
+        self.openProjectBtn = QtGui.QPushButton("Open project")
+        self.generateBtn    = QtGui.QPushButton("Generate model")
+        self.projectFiles   = QtGui.QListWidget()
 
         # Layout
-        self.projectGroupBox     = QtGui.QGroupBox("Project")
-        grid                    = QtGui.QGridLayout(self.projectGroupBox)
+        self.projectGroupBox = QtGui.QGroupBox("Project")
+        grid                 = QtGui.QGridLayout(self.projectGroupBox)
         grid.addWidget(self.projectFiles, 0, 0, 1, 3)
         grid.addWidget(self.openProjectBtn, 1, 0)
         grid.addWidget(self.generateBtn, 1, 1)
@@ -278,6 +290,7 @@ class Window(QtGui.QMainWindow):
     def setupParamGB(self):
         # Widgets
         self.paramList        = QtGui.QListWidget()
+        self.paramList.setSortingEnabled(True)
         self.codeText        = QtGui.QTextEdit()
 
         # Layout
@@ -311,7 +324,7 @@ class Window(QtGui.QMainWindow):
         # Signals
         selection = self.propositionTblWdg.selectionModel()
         selection.selectionChanged.connect(self.selectedPropositionChanged)
-
+        self.propositionTblWdg.model().emit(QtCore.SIGNAL("layoutChanged()"))
         # Initial behavior
 
 
@@ -380,7 +393,7 @@ class Window(QtGui.QMainWindow):
         for name in self.projectSetup.files:
             if not self.projectSetup.files[name].isComplete():
                 name = "* " + name
-            item = QtGui.QListWidgetItem(name)
+            item = IncompleteItem(name)
             self.projectFiles.addItem(item) #name)
 
         self.generateBtn.setEnabled(self.projectSetup.isComplete())
@@ -395,9 +408,9 @@ class Window(QtGui.QMainWindow):
 
         if not self.projectSetup.files[fileName].isComplete():
             fileName = "* " + fileName
-        
-        self.projectFiles.item(row).setText(fileName)
 
+        self.projectFiles.item(row).setText(fileName)
+        self.generateBtn.setEnabled(self.projectSetup.isComplete())
 
 
     def generateModel(self):
@@ -438,6 +451,7 @@ class Window(QtGui.QMainWindow):
 
 
     def refreshParamList(self, fileName, resetIndex = True):
+
         if resetIndex == False:
             row = self.paramList.currentRow()
 
@@ -447,9 +461,9 @@ class Window(QtGui.QMainWindow):
 
         for name, param in self.projectSetup.files[fileName].parameters.items():
             if param.isComplete():
-                item = QtGui.QListWidgetItem(name)
+                item = IncompleteItem(name)
             else:
-                item = QtGui.QListWidgetItem("* " + name)
+                item = IncompleteItem("* " + name)
 
             paramID = self.getIDFromName(name)
             if paramID is None:
@@ -524,20 +538,26 @@ class Window(QtGui.QMainWindow):
             self.loadParamValues(parameterStr)
         else:
             self.clearCustom()
-            self.propositionTblWdg.clearSelection() 
+            self.propositionTblWdg.clearSelection()
 
 
+    @property
+    def selectedParameter(self):
+        paramName           = stripIncomplete(self.paramList.currentItem().text())
+        fileName            = stripIncomplete(self.projectFiles.currentItem().text())
+        return self.projectSetup.files[fileName].parameters[paramName]
+        
+    @selectedParameter.setter
+    def selectedParameter(self, param):
+        paramName           = stripIncomplete(self.paramList.currentItem().text())
+        fileName            = stripIncomplete(self.projectFiles.currentItem().text())
+        self.projectSetup.files[fileName].parameters[paramName] = param
+        
+        
 
     def loadParamValues(self, parameterStr):
 
-
-        #row = self.propositionTblWdg.selectionModel().currentIndex().row()
-        #selectedProposition = self.propositionTblWdg.model().propositions[row]
-
-        paramName           = stripIncomplete(self.paramList.currentItem().text())
-        fileName            = stripIncomplete(self.projectFiles.currentItem().text())
-        selectedParameter   = self.projectSetup.files[fileName].parameters[paramName]
-
+        selectedParameter   = self.selectedParameter
         if isinstance(selectedParameter, CustomParameterInstance):
             self.customRadio.setChecked(True)
             self.customValue.setText(str(selectedParameter.value))
@@ -546,10 +566,17 @@ class Window(QtGui.QMainWindow):
 
         elif isinstance(selectedParameter, ModelParameterInstance):
             self.fromLitRadio.setChecked(True)
-            for noProposition, proposition in enumerate(self.propositionTblWdg.model().propositions): 
+
+            self.noUpdatePropositionSelection = True
+            self.propositionTblWdg.selectionModel().clearSelection()
+            for noProposition, proposition in enumerate(self.propositionTblWdg.model().propositions):
                 if proposition["obj_parameter"].id in selectedParameter.ids :
-                    self.propositionTblWdg.selectRow(noProposition)
-            
+                    #self.propositionTblWdg.selectRow(noProposition)
+                    selected = self.propositionTblWdg.model().index(noProposition, 0)
+                    flags = QtGui.QItemSelectionModel.Select | QtGui.QItemSelectionModel.Rows
+                    self.propositionTblWdg.selectionModel().select(selected, flags)
+            self.noUpdatePropositionSelection = False
+
         else:
             raise TypeError("selectedParameter should be of type CustomParameterInstance or ParameterInstance. Type passed: " + str(type(selectedParameter)))
 
@@ -572,41 +599,46 @@ class Window(QtGui.QMainWindow):
 
 
         #self.currentModelingParam = ParameterInstance(paramID)
-        searcher = ParameterSearch(pathDB=self.dbPath)
         #searcher.setSearchConditions(ConditionAtom("Parameter ID", paramID))
-        searcher.setSearchConditions(ConditionAtom("Parameter name", paramName))
-        searcher.expandRequiredTags = True
-        searcher.onlyCentralTendancy = True
-        resultDF = searcher.search()
-
-
+        self.searcher.setSearchConditions(ConditionAtom("Parameter name", paramName))
+        self.searcher.expandRequiredTags = True
+        self.searcher.onlyCentralTendancy = True
+        resultDF = self.searcher.search()
         self.propositionTableModel.refreshData(resultDF) #annotatedInstances, self.currentModelingParam)
-
 
 
     def selectedPropositionChanged(self, selected, deselected):
 
-        #TODO: ALLOW FOR MULTIPLE ROW SELECTIONS
-        row = self.propositionTblWdg.selectionModel().currentIndex().row()
-        print(selected, row)
-        selectedProposition = self.propositionTblWdg.model().propositions[row]
+        if self.noUpdatePropositionSelection:
+            return
 
-        paramName = stripIncomplete(self.paramList.currentItem().text())
-        fileName = stripIncomplete(self.projectFiles.currentItem().text())
-        self.projectSetup.files[fileName].parameters[paramName].referenceInstances = [selectedProposition["obj_parameter"]]
-        #self.refreshParamList(fileName, resetIndex=False) # No need, it is automatically called by events trigered by refreshFileList
+        selectedParameter = self.selectedParameter
+        if isinstance(selectedParameter, CustomParameterInstance):
+            return
 
-        self.refreshFileStatus()
-        print("project setup saved")
-        self.projectSetup.save()
+        rows = []
+        selectModel = self.propositionTblWdg.selectionModel()
+        if selectModel.hasSelection():
+            rows = [ind.row() for ind in selectModel.selectedRows()]
+
+        selectedPropositions = [self.propositionTblWdg.model().propositions[row] for row in rows]
+        referenceInstances = [prop["obj_parameter"] for prop in selectedPropositions]
+        if set(referenceInstances) != set(selectedParameter.referenceInstances):
+            selectedParameter.referenceInstances = referenceInstances
+            fileName = stripIncomplete(self.projectFiles.currentItem().text())
+            self.refreshParamList(fileName, resetIndex=False)
+            self.refreshFileStatus()
+            self.projectSetup.save()
 
 
     def saveCustom(self):
         paramName = stripIncomplete(self.paramList.currentItem().text())
-        fileName = stripIncomplete(self.projectFiles.currentItem().text())
-        self.projectSetup.files[fileName].parameters[paramName] = CustomParameterInstance(paramName, self.justification.toPlainText())
-        self.projectSetup.files[fileName].parameters[paramName].setValue(float(self.customValue.text()), self.customUnit.text())
-        #self.refreshParamList(fileName, resetIndex=False) # No need, it is automatically called by events trigered by refreshFileList
+        param = CustomParameterInstance(paramName, self.justification.toPlainText())
+        param.setValue(float(self.customValue.text()), self.customUnit.text())
+        self.selectedParameter = param
+        
+        fileName = stripIncomplete(self.projectFiles.currentItem().text())        
+        self.refreshParamList(fileName, resetIndex=False) 
         self.refreshFileStatus()
         self.projectSetup.save()
 
