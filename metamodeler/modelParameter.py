@@ -19,27 +19,33 @@ class AbstractParameterInstance:
       # the units in which it is specified, and the annotation and publication
     # ID it refers to.
 
-    def __init__(self):
-        self.__unit         = None
-        self.__value        = None
+    def __init__(self, requiredUnit=None):
+        self.__quantity = None
+        self.requiredUnit   = requiredUnit
 
     def setValue(self, value, unit):
+        self.__quantity = pq.Quantity(value, unit)
         # A value must always be set along with its unit. Else, it is meaningless.
-        self.__unit     = unit
-        self.__value    = value
-
-    def convertUnit(self, unit):
-        pass
+        if not self.requiredUnit is None:
+            if not unit != self.requiredUnit:
+                self.__quantity = self.__quantity.rescale(self.requiredUnit)
+        
+    #def convertUnit(self, unit):
+    #    pass
 
 
     @property
     def unit(self):
-        # Make unit validation
-        return self.__unit
+        if self.__quantity is None:
+            return None        
+        return str(self.__quantity.dimensionality)
 
     @property
     def value(self):
-        return self.__value
+        if self.__quantity is None:
+            return None
+        return self.__quantity.item()
+        
 
     def isComplete(self):
         # No need to check unit because value-units are always
@@ -53,6 +59,10 @@ class AbstractParameterInstance:
 
 
 class Transformation:
+    """
+     This class is used to define computationnaly how values of curated 
+     parameters are into values that are inserted in models.
+    """
 
     def __init__(self):
         self.transformationCode = ""    
@@ -102,10 +112,7 @@ class ModelParameterInstance (AbstractParameterInstance):
             
         if not transformation is None:
             self.transformation     = transformation
-            
-
-        self.__unit         = None
-        self.__value        = None
+ 
 
     
     @property
@@ -121,7 +128,8 @@ class ModelParameterInstance (AbstractParameterInstance):
         if not isinstance(referenceInstances, list):
             raise TypeError()
         self.__referenceInstances = referenceInstances
-        self.setValue(*self.transformation.apply(self.referenceInstances))
+        if len(referenceInstances):
+            self.setValue(*self.transformation.apply(self.referenceInstances))
         
     @property
     def transformation(self):

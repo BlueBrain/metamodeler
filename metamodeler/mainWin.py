@@ -3,26 +3,30 @@
 __author__ = "Christian O'Reilly"
 
 # Standard imports
-import sys
 import os
-import fnmatch
 import re
 import numpy as np
-import pickle
+from copy import copy
 
 # Contributed libraries imports
 from PySide import QtGui, QtCore
 
 # Local imports
+from .projectParameterWgt import ProjectParameterModel
 from .proposer import PropositionTableModel
-from .modelParameter import ModelParameterInstance, CustomParameterInstance, AbstractParameterInstance
-from .settingsDlg import getSettings, SettingsDlg
-from .utils import prettyPrintJSON
+from .modelParameter import ModelParameterInstance, CustomParameterInstance
+from .settingsDlg import getSettings
+from .tagParser import TagParser
+from .projectSetup import ProjectSetup
 
 # Import from nat
 from nat.modelingParameter import getParameterTypes
 from nat.annotationSearch import ParameterSearch, ConditionAtom, CompiledCorpus
 from nat.gitManager import GitManager
+from nat.tag import Tag
+
+# Import from neurocurator
+from neurocurator.modParamWidgets import RequiredTagsTableView
 
 
 class IncompleteItem(QtGui.QListWidgetItem):
@@ -38,85 +42,6 @@ def stripIncomplete(string):
     return string
 
 
-class ProjectSetup:
-    def __init__(self, path):
-        self.path = path
-        self.files = {} # Indexed by file name
-
-
-    def isComplete(self):
-        for f in self.files:
-            if not self.files[f].isComplete():
-                return False
-        return True
-
-    def save(self):
-        with open(os.path.join(self.path, ".mmproject.pck"), 'wb') as f:
-            pickle.dump(self, f)
-
-    @staticmethod
-    def load(path):
-        try:
-            with open(os.path.join(path, ".mmproject.pck"), 'rb') as f:
-                return pickle.load(f)
-        except:
-            return None
-
-    def generateModel(self):
-        for f in self.files:
-            self.files[f].generateModel()
-
-    def __str__(self):
-        return str(self.toJSON())
-
-    def __repr__(self):
-        return str(self.toJSON())
-
-    def toJSON(self):
-        return {"path": self.path,
-                "files": {fName:f.toJSON() for fName, f in self.files.items()}}
-
-
-class ParamDic(dict):
-    def __setitem__(self, key, value):
-        if not isinstance(value, AbstractParameterInstance):
-            raise TypeError
-        super(ParamDic, self).__setitem__(key, value)
-
-class FileSetup:
-
-    def __init__(self, fileName):
-        self.fileName = fileName
-        self.parameters = ParamDic() # Indexed by parameter name
-
-    def isComplete(self):
-        for paramName in self.parameters:
-            if not self.parameters[paramName].isComplete():
-                return False
-        return True
-
-
-    def generateModel(self):
-        with open(self.fileName, 'r') as f:
-            text = f.read()
-
-        for name, parameter in self.parameters.items():
-            text = text.replace("#|" + name + "|#", str(parameter.value))
-
-        with open(self.fileName.replace(".mm_", "."), 'w') as f:
-            f.write(text)
-
-
-    def __str__(self):
-        return str(self.toJSON())
-
-    def __repr__(self):
-        return str(self.toJSON())
-
-    def toJSON(self):
-        return {"fileName": self.fileName,
-                "parameters": {pName:p.toJSON() for pName, p in self.parameters.items()}}
-
 
 class Window(QtGui.QMainWindow):
     def __init__(self):
@@ -131,7 +56,6 @@ class Window(QtGui.QMainWindow):
         self.parameterTypes = getParameterTypes()
         #self.currentModelingParam = None
         self.projectSetup = None
-        self.ignore_patterns = ["*.*~"]
         
         self.noUpdatePropositionSelection = False
 
@@ -181,24 +105,30 @@ class Window(QtGui.QMainWindow):
     def setupWindowsUI(self) :
 
         self.setupProjectGB()
-        self.setupPropertiesGB()
+        #self.setupPropertiesGB()
         self.setupParamGB()
         self.setupPropositionsGB()
         self.setupCustomGB()
         self.setupSourceGB()
 
         # Main layout
-        self.mainWidget = QtGui.QWidget(self)
-        self.mainGrid = QtGui.QVBoxLayout(self.mainWidget)
+        self.mainGrid = QtGui.QSplitter(QtCore.Qt.Vertical, self)
+        self.mainGrid.setOrientation(QtCore.Qt.Vertical)
         self.mainGrid.addWidget(self.projectGroupBox)
-        self.mainGrid.addWidget(self.propertiesGroupBox)
+        #self.mainGrid.addWidget(self.propertiesGroupBox)
         self.mainGrid.addWidget(self.paramsGroupBox)
         self.mainGrid.addWidget(self.sourceGroupBox)
 
-        self.setCentralWidget(self.mainWidget)
-        self.interfaceSetup = True
-        self.setSource("lit")
+        self.sourceStack       = QtGui.QStackedWidget(self)
+        self.sourceStack.addWidget(self.propositionsGroupBox)
+        self.sourceStack.addWidget(self.customGroupBox)
+        self.sourceStack.setCurrentIndex(0)
+        self.mainGrid.addWidget(self.sourceStack)
 
+        
+
+        self.setCentralWidget(self.mainGrid)
+        self.interfaceSetup = True
 
 
     def setupSourceGB(self):
@@ -223,67 +153,60 @@ class Window(QtGui.QMainWindow):
 
 
     def fromLitToggled(self, checked):
+        if not self.interfaceSetup:
+            return
         if checked:
-            self.setSource("lit")
+            self.sourceStack.setCurrentIndex(0)
 
 
     def customToggled(self, checked):
-        if checked:
-            self.setSource("custom")
-
-    def setSource(self, source):
         if not self.interfaceSetup:
             return
-        if not self.sourceRef is None:
-            self.mainGrid.removeWidget(self.sourceRef)
-
-        if source == "lit":
-            self.sourceRef = self.propositionsGroupBox
-            self.customGroupBox.setVisible(False)
-            self.propositionsGroupBox.setVisible(True)
-
-        elif source == "custom":
-            self.sourceRef = self.customGroupBox
-            self.customGroupBox.setVisible(True)
-            self.propositionsGroupBox.setVisible(False)
-        else:
-            raise ValueError
-
-        self.mainGrid.addWidget(self.sourceRef)
+        if checked:
+            self.sourceStack.setCurrentIndex(1)
 
 
     def setupProjectGB(self):
         # Widgets
-        self.openProjectBtn = QtGui.QPushButton("Open project")
-        self.generateBtn    = QtGui.QPushButton("Generate model")
-        self.projectFiles   = QtGui.QListWidget()
+        self.openProjectBtn     = QtGui.QPushButton("Open project")
+        self.reloadBtn          = QtGui.QPushButton("Reload meta-model")
+        self.generateBtn        = QtGui.QPushButton("Generate model")
+        self.projectFiles       = QtGui.QListWidget()
+        
+        self.projectParamView      = RequiredTagsTableView()
+        self.projectParamModel     = ProjectParameterModel(self)
+        self.projectParamView.setModel(self.projectParamModel)
+        self.projectParamView.setEnabled(False)
+        self.projectParamModel.dataChanged.connect(self.projectPropertiesChanged)
+
 
         # Layout
         self.projectGroupBox = QtGui.QGroupBox("Project")
         grid                 = QtGui.QGridLayout(self.projectGroupBox)
-        grid.addWidget(self.projectFiles, 0, 0, 1, 3)
+        grid.addWidget(self.projectFiles, 0, 0, 1, 2)
+        grid.addWidget(self.projectParamView, 0, 2, 1, 2)
         grid.addWidget(self.openProjectBtn, 1, 0)
-        grid.addWidget(self.generateBtn, 1, 1)
-        #grid.addWidget(QtGui.QSpacerItem(), 1, 2)
+        grid.addWidget(self.reloadBtn, 1, 1)
+        grid.addWidget(self.generateBtn, 1, 2)
 
         # Signals
         self.openProjectBtn.clicked.connect(self.openProject)
+        self.reloadBtn.clicked.connect(self.reloadMetamodel)
         self.generateBtn.clicked.connect(self.generateModel)
         self.projectFiles.currentTextChanged.connect(self.fileSelected)
 
         # Initial behavior
         self.generateBtn.setDisabled(True)
+        self.reloadBtn.setDisabled(True)
 
-    def setupPropertiesGB(self):
-        # Widgets
-
-        # Layout
-        self.propertiesGroupBox     = QtGui.QGroupBox("")
-        grid                         = QtGui.QGridLayout(self.propertiesGroupBox)
-
-        # Signals
-
-        # Initial behavior
+    @QtCore.Slot(object, Tag)
+    def projectPropertiesChanged(self, tag):
+        self.projectSetup.properties = self.projectParamModel.getParamDict()
+        self.projectSetup.save()
+        
+        # Refresh the proposition table so that the coloring reflect
+        # the project properties.
+        self.proposeValuesFromCuration()
 
 
 
@@ -304,11 +227,12 @@ class Window(QtGui.QMainWindow):
 
         # Initial behavior
         self.codeText.setWordWrapMode(QtGui.QTextOption.NoWrap)
+        self.codeText.setReadOnly(True)
 
 
     def setupPropositionsGB(self):
         # Widgets
-        self.propositionTblWdg      = QtGui.QTableView()
+        self.propositionTblWdg         = QtGui.QTableView()
         self.propositionTableModel     = PropositionTableModel(self)
         self.propositionTblWdg.setModel(self.propositionTableModel)
         self.propositionTblWdg.setSelectionBehavior(QtGui.QAbstractItemView.SelectRows)
@@ -371,20 +295,17 @@ class Window(QtGui.QMainWindow):
         if self.projectSetup is None:
             self.projectSetup = ProjectSetup(self.projectPath)
 
-            matches = []
-            for root, dirnames, filenames in os.walk(self.projectPath):
-                for filename in fnmatch.filter(filenames, '*.mm_*'):
-                    ignore=False
-                    for ignore_pattern in self.ignore_patterns:
-                        if fnmatch.fnmatch(filename, ignore_pattern):
-                            ignore=True
-
-                    if not ignore:
-                        path = os.path.join(root, filename)
-                        self.preprocessFile(path)
-
+        self.projectParamView.setEnabled(True)
+        self.reloadBtn.setEnabled(True)
+        self.projectParamModel.setParamDict(self.projectSetup.properties)
         self.refreshFileList()
 
+
+    def reloadMetamodel(self):
+        self.projectSetup.reloadMM()
+        self.projectParamModel.setParamDict(self.projectSetup.properties)
+        self.refreshFileList()
+        self.paramList.clear()
 
 
     def refreshFileList(self):
@@ -426,24 +347,6 @@ class Window(QtGui.QMainWindow):
 
 
 
-    def preprocessFile(self, fileName):
-        name = (fileName.split(self.projectPath)[1])[1:]
-        self.projectSetup.files[name] = FileSetup(fileName)
-
-        p = re.compile('\#\|[0-9a-zA-Z_]+\|\#')
-
-        with open(os.path.join(self.projectPath, fileName), 'r') as f:
-            fileText = f.read()
-
-        for param in p.findall(fileText):
-            paramID = self.getIDFromName(param[2:-2])
-            if paramID is None:
-                self.projectSetup.files[name].parameters[param[2:-2]] = CustomParameterInstance(param[2:-2])
-            else:
-                self.projectSetup.files[name].parameters[param[2:-2]] = ModelParameterInstance(paramID)
-
-
-
     def fileSelected(self, fileName):
         if fileName != "":
             self.refreshParamList(fileName)
@@ -459,11 +362,11 @@ class Window(QtGui.QMainWindow):
 
         fileName = stripIncomplete(fileName)
 
-        for name, param in self.projectSetup.files[fileName].parameters.items():
+        for (name, args), param in self.projectSetup.files[fileName].parameters.items():
             if param.isComplete():
-                item = IncompleteItem(name)
+                item = IncompleteItem(name + "(" + str(args) + ")")
             else:
-                item = IncompleteItem("* " + name)
+                item = IncompleteItem("* " + name + "(" + str(args) + ")")
 
             paramID = self.getIDFromName(name)
             if paramID is None:
@@ -477,19 +380,24 @@ class Window(QtGui.QMainWindow):
 
     def updateCodeContext(self, parameterStr):
         nbLineContext = 3
-        p = re.compile('\#\|' + parameterStr + '\|\#')
-
         fileName = stripIncomplete(self.projectFiles.currentItem().text())
 
         with open(os.path.join(self.projectPath, fileName), 'r') as f:
             lines = f.readlines()
 
 
+        
+        reStr = TagParser.getREStr(paramName=parameterStr.split("(")[0])          
+        p = re.compile(reStr)
+        parser = TagParser()
 
         hits = []
         for noLine, line in enumerate(lines):
             if not p.search(line) is None:
-                hits.extend(range(max(noLine-nbLineContext, 0), min(noLine+nbLineContext+1, len(lines))))
+                paramTagStr =  line.split("#|")[1].split("|#")[0]
+                name, args = parser.getParamKey("#|" + paramTagStr + "|#")
+                if name + "(" + str(args) + ")" == parameterStr:
+                    hits.extend(range(max(noLine-nbLineContext, 0), min(noLine+nbLineContext+1, len(lines))))
 
         hits = np.unique(hits)
         lastAddedLine = -1
@@ -525,8 +433,8 @@ class Window(QtGui.QMainWindow):
         parameterStr = stripIncomplete(parameterStr)
 
         self.updateCodeContext(parameterStr)
-
-        if self.getIDFromName(parameterStr) is None:
+        paramName = parameterStr.split("(")[0]
+        if self.getIDFromName(paramName) is None:
             self.fromLitRadio.setEnabled(False)
             self.customRadio.setChecked(True)
         else:
@@ -541,17 +449,23 @@ class Window(QtGui.QMainWindow):
             self.propositionTblWdg.clearSelection()
 
 
+    def __selectedParameter(self):
+        paramKey = stripIncomplete(self.paramList.currentItem().text())
+        paramName = paramKey.split("(")[0]
+        paramKey = (paramName, paramKey[len(paramName)+1:-1])
+        fileName = stripIncomplete(self.projectFiles.currentItem().text())
+        return fileName, paramKey
+   
     @property
     def selectedParameter(self):
-        paramName           = stripIncomplete(self.paramList.currentItem().text())
-        fileName            = stripIncomplete(self.projectFiles.currentItem().text())
-        return self.projectSetup.files[fileName].parameters[paramName]
+        fileName, paramKey = self.__selectedParameter()
+        return self.projectSetup.files[fileName].parameters[paramKey]
         
     @selectedParameter.setter
     def selectedParameter(self, param):
-        paramName           = stripIncomplete(self.paramList.currentItem().text())
-        fileName            = stripIncomplete(self.projectFiles.currentItem().text())
-        self.projectSetup.files[fileName].parameters[paramName] = param
+        fileName, paramKey = self.__selectedParameter()
+        self.projectSetup.files[fileName].parameters[paramKey] = param
+        
         
         
 
@@ -587,7 +501,7 @@ class Window(QtGui.QMainWindow):
 
     def proposeValuesFromCuration(self):
 
-        paramName = stripIncomplete(self.paramList.currentItem().text())
+        paramName = stripIncomplete(self.paramList.currentItem().text()).split("(")[0]
         #paramID = None
         #
         #for paramType in self.parameterTypes:
@@ -603,8 +517,13 @@ class Window(QtGui.QMainWindow):
         self.searcher.setSearchConditions(ConditionAtom("Parameter name", paramName))
         self.searcher.expandRequiredTags = True
         self.searcher.onlyCentralTendancy = True
-        resultDF = self.searcher.search()
-        self.propositionTableModel.refreshData(resultDF) #annotatedInstances, self.currentModelingParam)
+        resultDF = self.searcher.search()   
+        
+        args = copy(self.projectParamModel.getParamDict())
+        args.update(self.selectedParameter.args)  
+        
+        self.propositionTableModel.refreshData(resultDF, args) #annotatedInstances, self.currentModelingParam)
+        
 
 
     def selectedPropositionChanged(self, selected, deselected):
